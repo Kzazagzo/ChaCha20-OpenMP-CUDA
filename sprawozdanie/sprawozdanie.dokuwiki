@@ -1,0 +1,607 @@
+==== Projekt:  ChaCha20 (OpenMP / CUDA)====
+
+^ Data ^ Status projektu    ^ Uwagi ^
+|2024-03-29| Wybór tematu    | |
+|TBA|Zaakceptowanie tematu|  |
+|2024-05-04|Skończenie implementacji algorytmy sekwencyjnego| |
+|2024-04-02|Skończenie implementacji OpenMP| |
+|2024-05-02|Skończenie implementacji Cuda| |
+|2024-05-29|Skończenie sprawozdania | |
+|TBA|Uwzględnienie uwag prowadzącego | |
+
+==== Autorzy ====
+Jakub Wieczorek, 151888
+
+==== Streszczenie ====
+ChaCha20 jest algorytmem szyfrowania strumieniowego z kluczem symetrycznym wykonującym 20 rund operacji bitowych takie jak (XOR, permutacje, przesunięcia).
+
+Celem projektu jest wykorzystanie mocy obliczeniowej karty graficznej do przyspieszenia procesu szyfrowania i deszyfrowania danych wykorzystując algorytm chacha20. Biblioteki cuda oraz openMP zostaną użyte do zrównoleglenia operacji kryptograficznych, rund szyfrujących oraz operacji bitowych na wielu rdzeniach GPU.
+
+Dane wejściowe zostaną podzielone na bloki i oddelegowane na wątki, gdzie każdy wątek będzie odpowiedzialny za szyfrowanie i odszyfrowanie pojedynczego bloku.
+
+Kluczowe etapy działania to:  
+
+1. Podział danych na bloki 64 bajtów  
+
+2. Inicjalizacja chacha20 dla każdego wątku gpu na podstawie klucza i wektora inicjalizującego 
+ 
+3. Przeprowadzenie 20 rund szyfrujących na każdym z bloków  
+
+4. Scalanie bloków w celu uzyskania ciągu wyjściowego
+
+----
+==== Składnia użycia skompilowanego programu ====
+./ChaCha20 {metoda} {wejście} {wyjście} {\{klucz\}} {\{nonce\}}
+^ pozostałe argumenty ^^
+| {metoda} | cuda,openmp,cpu |
+| {wejście} | nazwa pliku wejściowego |
+| {wyjście} | nazwa pliku wyjściowego |
+| {klucz} | opcjonalny - 8 elementowy klucz |
+| {nonce} | opcjonalny - 3 elementowa wartość jednorazowa |
+
+klucz i nonce muszą być podane po odstępach w formacie dziesiętym jako dodatnia liczba całkowita o maksymalnym rozmiarze uint8_t. Dla ułatwienia sprawdzania te dwa argumenty są opcjonalne i przyjmują bardzo bezpieczny klucz {0,1,2,3,4,5,6,7} oraz nonce {0,1,2}.
+
+Poprawnym działaniem programu jest zwrócenie pliku o nazwie 'wyjście' z zakodowanym ciągiem znaków. Większość popularnych błędów I/O zostały opisane specjalnymi błedami z opisem.
+
+Do czynienia mamy z szyfrem symetrycznym, więc żeby odkodować plik wystarczy uruchomić drugi raz szyfrowanie na tym samym kluczu i wartością nonce. Podanie błędnego klucza nie odszyfruje pliku - nawet zaszyfruje go bardziej.
+
+== Kompilacja programu ==
+>**Add0 **Uruchamianie pod windowsem nie jest wspierane, aczkolwiek możliwe - wystarczy usunąć z pliku konfiguracyjnego wpis blokujący konfigurację na nie linuxa. Usunięcie if (UNIX) i endif() w CMakeLists.txt, na końcu pozwoli na poprawną kompilację. Aczkolwiek jest to sposób nieprzetestowany, gdyż nie posiadam środowiska do kompilacji na systemach windows.
+Cała kompilacja zarządzana jest przez cmake, wymagany jest oczywiście cmke, dobry kompilator c++ (sugerowany clang) i program do budowania (np make). Z wymagań bibliotecznych zainstalowane narzędzia biblioteki cuda i openmp (sugerowane w najnowszej wersji) jest oczywiście obowiązkowe. Wszystko podłączone jest w jeden plik wykonywalny nazwany ChaCha20, którego instrukcja użycia jest powyżej.
+Budowanie odbywa się przez klasyczną serię komend:
+mkdir build; cd build
+cmake ..
+make
+----
+====Dane sprzętowe====
+Wszystkie operacje zwracające wyniki opisane w tym sprawozdaniu były wykonane na maszynie o danych specyfikacjach
+
+  * **System:** WSL(Windows 11)
+  * **Procesor:** AMD Ryzen 7 7800X3D 8-Core Processor 4.20 GHz
+  * **Karta graficzna:** NVIDIA GeForce RTX 4080
+  * **VRAM:** 16 GB
+  * **Pamięć RAM:** 32GB DDR5 6400 MHz
+
+Każda operacja była wykonywana przynajmniej 10 razy, aby uzyskać wyniki o wystarczającej dokładności (na poziomie studenckim). Dane dotyczące czasów wykonania zostały zebrane za pomocą narzędzia perf na systemie Linux. 
+Dodatkowo, program wykorzystuje bibliotekę chrono do mierzenia czasu wykonania w mniej precyzyjny sposób. Biblioteka ta jest przeznaczona dla osób, które nie mają dostępu do narzędzi profilowania, takich jak perf, a chciały by zmierzyć czas potrzebny na wykonanie algorytmów.
+
+----
+==== Semantyka implementacji na podstawie algorytmu sekwencyjnego ====
+
+ChaCha20 został zaprojektowany tak, aby jego algorytm mógł być łatwo (z)równoleglany. Każda z 20 rund operacji bitowych (XOR, permutacje, przesunięcia) może być wykonywana niezależnie na różnych blokach danych. To umożliwia algorytmowi efektywne wykorzystywanie równoległości na poziomie bloków, co jest kluczowe dla optymalizacji na architekturach GPU. ChaCha20 jest algorytmem strumieniowym, który generuje pseudolosowy strumień kluczy zależnych od klucza i licznika. Następnie ten strumień kluczy jest używany do zaszyfrowania danych poprzez operację XOR z danymi wejściowymi. Algorytm nie przeprowadza żadnych dodatkowych operacji przeszukujących na zbiorze danych, co sprawia, że jego złożoność wynosi O(n), gdzie n jest rozmiarem danych wejściowych.
+
+----
+=== Główna funkcja szyfrująca ===
+
+Algorytm do poprawnego działania wymaga podania wskaźnika do struktury z wczytanym danymi wraz z ich liczbą elementów.
+
+<code cpp>
+encrypt(uint8_t *data, size_t length, const uint32_t key[8], uint32_t nonce[3], uint32_t counter)
+</code>
+^ pozostałe argumenty ^^
+|** key[8] **| Do przeprowadzenia operacji kryptograficznej algorytm korzysta z 256 bitowego klucza podanego jako tablica 8 elementów po 32-bitach. Na bazie klucza wyznaczany jest stan początkowy algorytmu przez serię operacji. Podstawa ta używana jest do operacji kryptograficznej. | 
+|** nonce[3] (wartość jednorazowa) **| jest 96 bitową wartością (3 elementy 32-bitowe) unikalną dla całej operacji szyfrowania, generowaną losowo dla dodatkowego zabezpieczenia generowania keystreamu. Jego głównym zadaniem jest zabezpieczenie wiadomości w wyniku wycieku oryginalnego klucza szyfrowania. (Dla przykładu deszyfracja wiadomości ze znanym kluczem zajęłaby około 2.5 miliarda lat przy założeniu prędkości sprawdzania biliona kombinacji na sekundę). |
+|** counter **| o rozmiarze 32-bitów ustawiony domyślnie na 0 służy do numerowania kolejnych zaszyfrowanych bloków danych. Pozwalając na asynchroniczne szyfrowanie, pod warunkiem znajomości kolejnych numerów porządkowych. Także zabezpiecza przed atakiem odszyfrowania pojedynczego bloku danych w celu odgadnięcia szyfru. |
+
+Funkcja encrypt dzieli dane na chunki (o specyficznym rozmiarze chunkSize dla konkretnego pliku, domyślnie 64MB - jednak ta wartość będzie optmymalizowana w dalszej części sprawozdania), a następnie szyfruje każdy chunk oddzielnie za pomocą funkcji chaCha20Encrypt. Każdy chunk jest przetwarzany w kontekście klucza, wartości jednorazowej (nonce) oraz licznika, co zapewnia bezpieczne i efektywne szyfrowanie dużych zestawów danych. Dzięki podziałowi danych na chunki możliwe jest przetwarzanie bardzo dużych plików, które nie zmieściłyby się w pamięci w całości.
+
+> **Add 1:** pomimo tego, że implementacje korzystają ze strumieni i pozwalają na wczytanie plików większych niż dostępna pamięć ram/vram. Nie zalecam używania tego na tak dużych plikach. Problemem jest tutaj sposób obsługi plików przez windows (w szczególności wsl - to katastrofa), linux nawet daje sobie radę.
+
+<code cpp>
+void ChaCha20Cpu::encrypt(uint8_t *data, size_t length, const uint32_t key[8],
+                          const uint32_t nonce[3], uint32_t counter) {
+  size_t numChunks = (length + chunkSize - 1) / chunkSize;
+
+  for (size_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx) {
+    size_t offset = chunkIdx * chunkSize;
+    size_t currentChunkSize =
+        (offset + chunkSize <= length) ? chunkSize : (length - offset);
+
+    ChaChaCpu::chaCha20Encrypt(data + offset, currentChunkSize, key, nonce,
+                               counter + chunkIdx);
+  }
+}
+</code>
+----
+=== Przetwarzanie pojedynczego fragmentu ===
+
+W ramach wydzielonego fragmentu przez poprzednią funkcję wyznaczany jest keystream na bazie początkowego stanu zdefiniowanego przez:
+$$
+\begin{bmatrix}
+    \text{constant[0]} & \text{constant[1]} & \text{constant[2]} & \text{constant[3]} \\
+    \text{key[0]} & \text{key[1]} & \text{key[2]} & \text{key[3]} \\
+    \text{key[4]} & \text{key[5]} & \text{key[6]} & \text{key[7]} \\
+    \text{counter} & \text{nonce[0]} & \text{nonce[1]} & \text{nonce[2]}
+\end{bmatrix}
+$$
+Wartości constant są specyficznie dobrane dla algorytmu chacha20 i są tak zwanymi "Nothing-up-my-sleeve number"[[bibliografia#3|[3]]], a dokładniej "expand 32-byte k"[[bibliografia#4|[4]]]
+
+Następnie fragment jest szyfrowany. Początkowy stan (output) jest przetważany przez następujące funkcję
+<code cpp>
+void quarter_round(uint32_t &a, uint32_t &b, uint32_t &c, uint32_t &d) {
+  a += b; d ^= a; d = (d << 16) | (d >> 16);
+  c += d; b ^= c; b = (b << 12) | (b >> 20);
+  a += b; d ^= a; d = (d <<  8) | (d >> 24);
+  c += d; b ^= c; b = (b <<  7) | (b >> 25);
+}
+
+void chacha20_block(uint32_t *output, const uint32_t *input) {
+  for (int i = 0; i < 16; ++i) {
+    output[i] = input[i];
+  }
+  for (int i = 0; i < 10; ++i) {
+    quarter_round(output[0], output[4], output[8], output[12]);
+    quarter_round(output[1], output[5], output[9], output[13]);
+    quarter_round(output[2], output[6], output[10], output[14]);
+    quarter_round(output[3], output[7], output[11], output[15]);
+    quarter_round(output[0], output[5], output[10], output[15]);
+    quarter_round(output[1], output[6], output[11], output[12]);
+    quarter_round(output[2], output[7], output[8], output[13]);
+    quarter_round(output[3], output[4], output[9], output[14]);
+  }
+  for (int i = 0; i < 16; ++i) {
+    output[i] += input[i];
+  }
+}
+</code>
+W każdej z 20 rund (tak naprawdę 10 podwójnych rund) wykonuje się quarter_round na kombinacji słów z output. Sam quarter_round miesza 4 słowa z klucza - wykonując na nim kombinacje dodawania, operacji XOR oraz rotacji bitowych. Żeby zapewnić dobre rozproszenie, wykonywane są najpierw operacje na kolumnach, a następnie na przekątnych klucza.
+----
+=== Przetwarzanie końcowe fragmentu ===
+
+ Po wykonaniu wszystkich rund - początkowy stan wewnętrzny jest dodawany do końcowego stanu, co zapewnia dodatkowe bezpieczeństwo. Ta operacja nazywa się dodawaniem klucza i ma na celu dalsze zabezpieczenie danych. Ostateczny zmodyfikowany stan jest używany jako keystream, który jest następnie używany do operacji XOR z plaintextem w celu uzyskania szyfrogramu.
+
+<code cpp>
+void chaCha20Encrypt(uint8_t *data, size_t length, const uint32_t *key,
+                     const uint32_t *nonce, uint32_t counter) {
+  uint32_t state[16] = {0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+                        key[0],     key[1],     key[2],     key[3],
+                        key[4],     key[5],     key[6],     key[7],
+                        counter,    nonce[0],   nonce[1],   nonce[2]};
+
+  uint32_t keystream[16];
+  uint8_t keystream8[64];
+  
+  for (size_t offset = 0; offset < length; offset += 64) {
+    chacha20_block(keystream, state);
+
+    for (int i = 0; i < 16; ++i) {
+      ((uint32_t*)keystream8)[i] = keystream[i];
+    }
+
+    for (size_t i = 0; i < 64 && offset + i < length; ++i) {
+      data[offset + i] ^= keystream8[i]; // XOR
+    }
+
+    if (++state[12] == 0) {
+      ++state[13]; // zwiększa counter
+    }
+  }
+}
+</code>
+
+{{bardzoLadnaGrafika.png}}
+
+> To jest bardzo ładna grafika podsumowująca działanie ChaCha20[[bibliografia#4|[5]]].
+----
+==== Implementacja w cudzie i jej optymalizacje ====
+<code cpp>
+double ChaChaCuda::ChaCha20Cuda::encrypt(uint8_t *data, size_t length,
+                                         const uint32_t key[8],
+                                         const uint32_t nonce[3],
+                                         uint32_t counter) {
+  uint8_t *cudaData[this->numStreams];
+  cudaStream_t streams[this->numStreams];
+
+  for (int i = 0; i != this->numStreams; i++) 
+    cudaMalloc(&cudaData[i], chunkSize);
+    cudaStreamCreate(&streams[i]);
+
+  cudaMemcpyToSymbol(ChaChaCuda::key, key, sizeof(uint32_t) * 8);      // extern __constant__ uint32_t key[8];
+  cudaMemcpyToSymbol(ChaChaCuda::nounce, nonce, sizeof(uint32_t) * 3); //  extern __constant__ uint32_t nounce[3];
+
+  int optimalBlocks = calculateOptimalBlocks(threadsPerBlock);
+
+  for (size_t chunkIdx = 0; chunkIdx < numChunks; ++chunkIdx) {
+    int streamIdx = chunkIdx % this->numStreams;
+    size_t offset = chunkIdx * chunkSize;
+    size_t currentChunkSize =
+        (offset + chunkSize <= length) ? chunkSize : (length - offset);
+
+    cudaMemcpyAsync(cudaData[streamIdx], data + offset, currentChunkSize,
+                    cudaMemcpyHostToDevice, streams[streamIdx]);
+
+    int numBlocks = optimalBlocks;
+
+    ChaChaCuda::chaCha20EncryptKernel<<<numBlocks, this->threadsPerBlock, 0,
+                                        streams[streamIdx]>>>(
+        cudaData[streamIdx], currentChunkSize, counter + chunkIdx);
+
+    cudaMemcpyAsync(data + offset, cudaData[streamIdx], currentChunkSize,
+                    cudaMemcpyDeviceToHost, streams[streamIdx]);
+  }
+
+   for (int i = 0; i != this->numStreams; i++) {
+    cudaStreamSynchronize(streams[i]);
+  }
+}
+</code>
+W odróżnieniu od algorytmu sekwencyjnego, wykonane są tutaj specjalne optymalizację pozwalające na znaczne przyspieszenie algorytmu. Utworzone strumienie pozwalają na dodatkowe przetważanie równoległe danych, gdy operujemy na większych plikach (dobranie specyficznych parametrów opisane jest w sekcji niżej). 
+Klucz i nonce kopiowane są do pamięci stałej GPU tak aby były dostępne przez wszystkie wątki.
+
+<code cpp>
+__global__ void chaCha20EncryptKernel(uint8_t *data, size_t length,
+                                      uint32_t counter) {
+  uint32_t state[16] = /* Identyczne jak w algorytmie sekwencyjnym */
+
+  __shared__ uint32_t keystream[16];
+  size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t offset = idx * sizeof(uint4); // Adjusted to align with uint4
+
+  if (offset < length) {
+    ChaCha20Cuda::chacha20_block(keystream, state);
+
+    uint4 *data4 = reinterpret_cast<uint4 *>(data + offset);
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      if (offset + i * sizeof(uint4) < length) {
+        uint4 value = data4[i];
+        value.x ^= keystream[(threadIdx.x * 4 + 0) % 16];
+        value.y ^= keystream[(threadIdx.x * 4 + 1) % 16];
+        value.z ^= keystream[(threadIdx.x * 4 + 2) % 16];
+        value.w ^= keystream[(threadIdx.x * 4 + 3) % 16];
+        data4[i] = value;
+      }
+    }
+  }
+}
+</code>
+Aby przyspieszyć działanie algorytmu, keystream jest współdzielony pomiędzy wątkami w bloku. Każdy wątek oblicza część wartości keystreamu na podstawie swojego indeksu. Dodatkowo, dane są rzutowane na typ uint4, co pozwala GPU na bardziej efektywne operacje i koalescencję. Pętla zajmująca się operacjami XOR jest rozwinięta, co zwiększa wydajność poprzez usunięcie narzutu związanego z iteracją. Ostatecznie, przetworzone dane z bloku są zapisywane i przenoszone do wyniku szyfrowania w pliku, co zapewnia szybkie i równoległe przetwarzanie danych.
+
+Funkcje quarter_round oraz chacha20_block są wykonywane na karcie graficznej - ich działanie i kod jest identyczne jak w algorytmie sekwencyjnym, poza dodaniem #pragma unroll do wszystkich pętl for.
+----
+=== Analiza profilera ===
+{{pamiec.png}}
+
+Analiza pamięciowa wczytana jest jednocześnie dla dwóch konfiguracji wczytujące ten sam plik do szyfrowania o rozmiarze 150MB. Pierwsza(względem której pokazywane są procenty) wykonywała program z użyciem 16 strumieni na 256 blokach. Druga - bez strumieni na wszystkich (1024) dostępnych blokach.
+
+Sam program nie jest zoptymalizowany pod kątem maksymalnego wykorzystania pamięci dostępnej przez kartę graficzną. Zadanie, które wykonujemy, obejmuje głównie podstawowe operacje matematyczne, więc nie wymaga intensywnego dostępu do pamięci.
+{{through.png}}
+Brak pełnej optymalizacji pamięciowej wynika z faktu, że większość dostępnych zasobów obliczeniowych karty jest już wykorzystywana, co wskazuje na wysoki wskaźnik "computation" w sekcji GPU throughput.
+{{usage.png}}
+
+>**Add 2:** Najczęściej wykonywanymi operacjami na karcie graficznej są operacje z rodziny ALU, czyli operacje arytmetyczno-logiczne. To właśnie te operacje stanowią wąskie gardło, ponieważ bloki wątków muszą oczekiwać na dostęp do jednostek ALU, aby móc przetwarzać swoje dane.
+{{stalls.png}}
+>**Add 3:** Średnio 4 z 32 wątków w grupie oczekuje z powodu "Stall Not Selected". Oznacza to, że wątki muszą czekać na powiązane dane niezbędne do obliczeń, takie jak zależności przy obliczaniu części klucza. Inną przyczyną oczekiwania jest "Stall math pipe throttle", co oznacza, że wszystkie dostępne jednostki obliczeniowe są zajęte, co uniemożliwia natychmiastowe wykonanie operacji matematycznych na danych.
+
+Sugerowanym działaniem przez NVIDIĘ do dalszej optymalizacji programu jest możliwe odroczenie operacji matematycznych przez zastąpienie ich innym typem operacji. Jednak w przypadku algorytmów szyfrujących jest to niemożliwe, ponieważ główne operacje przetwarzania to właśnie operacje matematyczne i nie ma innych operacji, które moglibyśmy wykonywać w ich miejsce.
+----
+=== Prędkość wykonywania szyfrowania dla różnych konfiguracji ===
+
+<achart>
+{
+  "title": { "text": "Wykonanie operacji szyfrowania na pliku w zależności od liczby wątków na blok" },
+  "yaxis": [
+    { "seriesName": "Czas [s]", "title": { "rotate": -90, "text": "Czas [s]" } }
+  ],
+  "xaxis": { "seriesName": "Rozmiar pliku [MB]", "title": { "text": "Rozmiar pliku [MB]" } },
+  "series": [
+    {
+      "name": "32 wątki",
+      "data": [0.00166863, 0.0102615, 0.02523, 0.0492363, 0.13529]
+    },
+    {
+      "name": "64 wątki",
+      "data": [0.00151831, 0.00963757, 0.0252604, 0.0486321,0.138965]
+    },
+    {
+      "name": "128 wątki",
+      "data": [0.0014434, 0.00957065, 0.0259191, 0.0486931,0.112125]
+    },
+    {
+      "name": "256 wątki",
+      "data": [0.00149929, 0.0101999, 0.0271825, 0.0493717,0.146262]
+    },
+    {
+      "name": "512 wątki",
+      "data": [0.00143859, 0.0101036, 0.0256627, 0.0480083,0.124493]
+    },
+    {
+      "name": "1024 wątki",
+      "data": [0.00141785, 0.0097487, 0.0251417, 0.0474141,0.125607]
+    }
+  ],
+  "chart": { "type": "bar" },
+  "dataLabels": { "enabled": false },
+  "labels": [10, 60, 110, 160, 1000]
+}
+</achart>
+
+Wykres przedstawia jak liczba wątków w bolku koreluje z prędkością wykonania operacji szyfrowania (gdzie w tym badaniu, nie jest brane pod uwagę przenoszenie zawartościu pliku do pamięci).
+
+<achart>
+{
+  "title": { "text": "Wykonanie operacji szyfrowania na pliku w zależności od liczby liczby strumieni" },
+  "yaxis": [
+    { "seriesName": "Czas [s]", "title": { "rotate": -90, "text": "Czas [s]" } }
+  ],
+  "xaxis": { "seriesName": "Rozmiar pliku [MB]", "title": { "text": "Rozmiar pliku [MB]" } },
+  "series": [
+    {
+      "name": "1 strumień",
+      "data": [0.0271023, 0.0808915, 0.161431, 0.264927, 0.388095]
+    },
+    {
+      "name": "2 strumienie",
+      "data": [0.0236379, 0.0735885, 0.146351, 0.24014, 0.382663]
+    },
+    {
+      "name": "4 strumienie",
+     "data": [0.023558, 0.07304, 0.147101, 0.242169, 0.357529]
+    },
+    {
+      "name": "8 strumienie",
+     "data": [0.0236379, 0.0735885, 0.146351, 0.24014, 0.382663]
+    },
+    {
+      "name": "16 strumienie",
+     "data": [0.0277548, 0.0873702, 0.170899, 0.264811, 0.383823]
+    },
+    {
+      "name": "32 strumienie",
+      "data": [0.0277548, 0.0873702, 0.170899, 0.264811, 0.383823]
+    }
+  ],
+  "chart": { "type": "bar" },
+  "dataLabels": { "enabled": false },
+  "labels": [200, 400, 600, 800, 1000]
+}
+</achart>
+
+<achart>
+{
+  "title": { "text": "Wykonanie operacji szyfrowania na pliku w zależności od rozmiaru kawałka" },
+  "yaxis": [
+    { "seriesName": "Czas [s]", "title": { "rotate": -90, "text": "Czas [s]" } }
+  ],
+  "xaxis": { "seriesName": "Rozmiar pliku [MB]", "title": { "text": "Rozmiar pliku [MB]" } },
+  "series": [
+     {
+      "name": "1 MB",
+      "data": [0.058765, 0.162438, 0.314522, 0.531292, 0.801107]
+    },
+    {
+      "name": "2 MB",
+      "data": [0.0350236, 0.106875, 0.217731, 0.362126, 0.543099]
+    },
+    {
+      "name": "4 MB",
+      "data": [0.0356514, 0.0932702, 0.191842, 0.316864, 0.461777]
+    },
+    {
+      "name": "8 MB",
+      "data": [0.0282658, 0.0793728, 0.160691, 0.276187, 0.437687]
+    },
+    {
+      "name": "16 MB",
+      "data": [0.025284, 0.0748624, 0.149626, 0.253408, 0.383413]
+    },
+    {
+      "name": "32 MB",
+      "data": [0.0258672, 0.0850117, 0.156406, 0.251874, 0.40303]
+    },
+    {
+      "name": "64 MB",
+      "data": [0.0246271, 0.0816384, 0.156459, 0.262892, 0.386739]
+    }
+  ],
+  "chart": { "type": "bar" },
+  "dataLabels": { "enabled": false },
+  "labels": [200, 400, 600, 800, 1000]
+}
+</achart>
+
+Jak też można zauważyć dzielenie pracy na jeszcze dodatkowe bloki od 1 do 64 MB, które to znowu konwertują po każde 64 bajty pliku, wpływa negatywnie na prędkość szyfrowania. Dlatego też dla kolejnych porównań z innymi implementacjami algorytmu będziemy wykorzystywać konfigurację 128 wątków na blok. 4 jednoczesnych strumieni konwersji i bez podziału na dodatkowe bloki związane z rozmiarem plików.
+----
+=== Przenoszenie danych do pamięci karty graficznej ===
+<achart>
+{
+    title: {
+        text: "Czas potrzebny na transfer danych na i z pamięci karty graficznej"
+    },
+    "xaxis": { "seriesName": "Rozmiar pliku [MB]", "title": { "text": "Rozmiar pliku [MB]" } },
+    "yaxis": [{
+        seriesName: "algorytmy",
+        title: {
+            rotate: -90,
+            text: "Czas[s]"
+        }
+    }],
+    
+    "series": [{
+        "name": "Przenoszenie danych",
+        "data": [0.0264549, 0.0532898, 0.0702056, 0.0958054, 0.13085]
+    },
+    {
+        name: "Faktyczne obliczenia",
+        data: [0.0000865091, 0.0000916564, 0.000108464,0.00010412, 0.000137039]
+    }],
+    chart: {
+        type: 'line',
+        zoom: {
+            enabled: false
+        }
+    },
+    dataLabels: {
+        enabled: false
+    },
+    labels: [
+        200,400,600,800,1000
+    ],
+    stroke: {
+        curve: 'straight'
+    },
+}
+</achart>
+
+Większość czasu w procesie przetwarzania danych na GPU jest spędzana na przesyłaniu danych między pamięcią główną a pamięcią karty graficznej, a nie na faktycznych obliczeniach. Jest to szczególnie widoczne na tym wykresie, gdzie czas transferu danych jest o rzędy wielkości większy niż czas obliczeń. Wynika to z faktu, że transport danych przez magistralę PCIe wiąże się z jej ograniczeniami prędkościowymi.
+
+Aby częściowo przyspieszyć przesył danych, wykorzystany został asynchroniczny transfer, który pozwala na wcześniejsze rozpoczęcie pracy przez niektóre bloki. Rozważałem także użycie kompresji z biblioteką zlib, jednakże skompresowane dane muszą być przetwarzane przez algorytm szyfrujący, co zakłóciłoby strukturę archiwum, uniemożliwiając poprawną konwersję.
+
+----
+==== Implementacja w openMP i jej optymalizacje ====
+<code cpp>
+void chaCha20Encrypt(uint8_t *data, size_t length, const uint32_t *key,
+                     const uint32_t *nonce, uint32_t counter) {
+  size_t numBlocks = (length + 63) / 64;
+
+#pragma omp parallel for num_threads(numThreads) schedule(static)
+  for (size_t blockIdx = 0; blockIdx < numBlocks; ++blockIdx) {
+    uint32_t state[16] = /* Identyczne jak w algorytmie sekwencyjnym */
+
+    uint32_t keystream[16];
+    uint8_t keystream8[64];
+
+    chacha20_block(keystream, state);
+    
+#pragma omp simd
+    for (int i = 0; i < 16; ++i) {
+      ((uint32_t *)keystream8)[i] = keystream[i];
+    }
+
+    size_t offset = blockIdx * 64;
+    for (size_t i = 0; i < 64 && offset + i < length; ++i) {
+      data[offset + i] ^= keystream8[i]; // XOR
+    }
+
+    if (++state[12] == 0) {
+      ++state[13];
+    }
+  }
+}
+</code>
+Podobnie jak w cudzie za pomocą openmp chcemy zrównoleglić jak najwięcej operacji, korzystając omp parallel , tworzymy region równoległy, gdzie każdy z konwersję bloków z równym rozłożeniem. Pętlę - które zajmują się przenoszeniem wyniku, są wektoryzowane do przyspieszenia operacji przypisania.
+
+Tak samo też, jak w cudzie przy operacji na pojedynczym bloku używane są simd do sprawniejszego przenoszenia danych tak jak tam unroll.
+
+<achart>
+{
+    title: {
+        text: "Wykonanie operacji szyfrowania na pliku (400MB) w zależności od liczby wątków"
+    },
+    yaxis: [{
+        seriesName: "algorytmy",
+        title: {
+            rotate: -90,
+            text: "Czas[s]"
+        }
+    }],
+    
+    series: [{
+        name: "Czas w sekundach",
+        data: [
+            0.664925, 0.369588, 0.264718, 0.202274, 0.157512, 0.133851, 
+            0.115081, 0.108872, 0.105012, 0.098584, 0.0911703, 0.0880087, 
+            0.0806807, 0.0754629, 0.0720847, 0.0700098, 0.086493, 0.0907108, 
+            0.0835539, 0.083403, 0.0776647, 0.0746795, 0.0745002
+        ]
+    }],
+      "xaxis": {  "title": { "text": "Liczba wątków []" } },
+    chart: {
+        type: 'line',
+        zoom: {
+            enabled: false
+        }
+    },
+    dataLabels: {
+        enabled: false
+    },
+    labels: [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 
+        20, 24, 28, 32
+    ],
+    stroke: {
+        curve: 'straight'
+    },
+}
+</achart>
+
+Można zauważyć, że wraz ze wzrostem liczby wątków - operacje współbieżne są wykonywane szybciej, co jest zgodne z oczekiwaniami. Warto przypomnieć, że maszyna, na której przeprowadzono obliczenia, posiadała maksymalnie 16 wątków.
+
+Więc, użycie więcej niż 16 wątków powoduje spowolnienie operacji, co jest wynikiem konieczności współdzielenia zasobów procesora między większą liczbę wątków. Jednakże przy liczbach będących potęgami maksymalnej liczby wątków (16), takich jak 32, czas wykonania operacji osiąga lokalne minimum, co może wskazywać na pewną optymalizację współdzielenia zasobów. W takim też razie przy porównaniu wszystkich implementacji openmp będzie wykorzystywało maksymalną (optymalną) liczbę wątków dla maszyny.
+----
+==== Porównanie implementacji ====
+
+<achart>
+{
+    title: {
+        text: "Wykonanie operacji szyfrowania na pliku w zależności od implementacji algorytmu"
+    },
+    yaxis: [{
+        seriesName: "$y$",
+        title: {
+            rotate: -90,
+            text: "Czas [s]"
+        }
+    }],
+     "xaxis": { "seriesName": "Rozmiar pliku [MB]", "title": { "text": "Rozmiar pliku [MB]" } },
+    series: [{
+        name: "CUDA",
+        data: [0.0287355, 0.0478008, 0.070451, 0.100721, 0.12447]
+    }, {
+        name: "OpenMP",
+        data: [0.0377658, 0.0740391, 0.105108, 0.138153, 0.172535]
+    }, {
+        name: "CPU",
+        data: [0.339157, 0.670854, 1.00844, 1.36183, 1.69452]
+    },
+    {
+        name: "CUDA (bez przenoszenia)",
+        data: [0.000102076, 0.000110726, 0.000129285, 0.000126532, 0.000136532]
+    }],
+    chart: {
+        type: 'line',
+        zoom: {
+            enabled: false
+        }
+    },
+    dataLabels: {
+        enabled: false
+    },
+    labels: [200, 400, 600, 800, 1000],
+    stroke: {
+        curve: 'straight'
+    },
+    markers: {
+        size: 1
+    }
+}
+</achart>
+
+Warto wspomnieć, że api wykresów pozwala na wyłączenie seri danych (np CPU [czyli algorytmu sekwencyjnego])
+----
+==== Podsumowanie ====
+----
+
+Projekt rozpoczął się od implementacji algorytmu szyfrowania ChaCha20 w wersji sekwencyjnej. Algorytm ten jest wykorzystywany do szyfrowania strumieniowego z kluczem symetrycznym, wykonując 20 rund operacji bitowych takich jak XOR, permutacje i przesunięcia. ChaCha20 jest znany z wysokiej wydajności i bezpieczeństwa, co czyni go idealnym kandydatem do optymalizacji pod kątem zrównoleglenia.
+
+Pierwsza część projektu polegała na przeniesieniu algorytmu z wersji sekwencyjnej na OpenMP, co pozwoliło na zrównoleglenie operacji na wielu rdzeniach procesora. Użycie dyrektyw OpenMP, takich jak #pragma omp parallel for oraz #pragma omp simd, pozwoliło na przyspieszenie mozolnych operacji, a co za tym idzie przyspieszyło - działanie całego procesu szyfrowania. Wyniki testów pokazały, że implementacja OpenMP jest znacznie szybsza niż wersja sekwencyjna, szczególnie na maszynach z dużą liczbą rdzeni (czyli w aktualnych czasach - każdych).
+
+Druga część wykorzystywała platformę cuda jako środowisko, która wykorzystuje mocy obliczeniową karty graficznej. Implementacja na CUDA wymagała przepisania części kodu, aby dostosować ją pod architekturę GPU i jej zasad programowania równoległego. Użycie pamięci współdzielonej (__shared__ i __constant__) oraz odpowiednie zarządzanie wątkami (__global__ i __device__) pozwoliło na maksymalne wykorzystanie zasobów GPU. Wyniki testów wykazały, że implementacja CUDA była jeszcze szybsza niż wersja OpenMP, osiągając czas wykonania operacji szyfrowania kilkukrotnie krótszy niż w wersji sekwencyjnej (i kilkuset szybszym bez brania pod uwagę przenoszenia danych).
+
+Jednym z problemów związanych z implementacją CUDA jest wcześniej wspomniana konieczność przenoszenia danych między pamięcią główną (RAM) a pamięcią karty graficznej (VRAM). Transfer danych stanowi wąskie gardło, ograniczając potencjalne przyspieszenie wynikające z równoległego przetwarzania na GPU. Gdyby żyć w idealnym świecie, gdzie wszystkie dane mogłyby być bezpośrednio ładowane do VRAM, program działałby jeszcze szybciej, eliminując opóźnienia związane z transferem danych.
+
+Porównanie trzech implementacji – sekwencyjnej, OpenMP i CUDA – jasno pokazało, że zrównoleglenie algorytmu ChaCha20 prowadzi do znaczącego przyspieszenia operacji szyfrowania. Implementacja CUDA była najszybsza, co wynika z ogromnej liczby rdzeni obliczeniowych dostępnych na nowoczesnych kartach graficznych. OpenMP również zapewniło znaczące przyspieszenie, szczególnie na maszynach z dużą liczbą rdzeni CPU.
+
+Zrównoleglenie algorytmu ChaCha20 znacząco zwiększa jego wydajność. Wykorzystanie OpenMP i CUDA pozwala na pełne wykorzystanie nowoczesnych architektur wielordzeniowych i GPU, co jest szczególnie istotne w zastosowaniach wymagających szybkiego przetwarzania dużych ilości danych. Projekt pokazał również, że odpowiednie podejście do optymalizacji i zrównoleglenia kodu w większości przypadków przyniesie korzyści w postaci skrócenia czasu wykonywania operacji kryptograficznych.
+
+
+==== Bibliografia  ====
+  * [1]  [[https://en.wikipedia.org/wiki/ChaCha20-Poly1305]]
+  * [2]  [[https://en.wikipedia.org/wiki/Salsa20#ChaCha_variant]]
+  * [3]  [[https://en.wikipedia.org/wiki/Nothing-up-my-sleeve_number]]
+  * [4]  [[http://cr.yp.to/snuffle/security.pdf]] - liczby te działają na podobnej zasadzie co w algorytmie salsa20, gdyż są z tej samej rodziny algorytmów
+  * [5]  [[https://www.cloud-conf.net/ispa2021/proc/pdfs/ISPA-BDCloud-SocialCom-SustainCom2021-3mkuIWCJVSdKJpBYM7KEKW/264600b171/264600b171.pdf]]
+
+==== Repozytorium z kodem ====
+[[https://github.com/Kzazagzo/ChaCha20-OpenMP-CUDA]]
